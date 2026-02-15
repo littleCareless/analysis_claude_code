@@ -1,112 +1,62 @@
 # v3: Subagent Mechanism
 
-**~450 lines. +1 tool. Divide and conquer.**
+**Core insight: Process isolation = context isolation.**
 
-v2 adds planning. But for large tasks like "explore the codebase then refactor auth", a single agent hits context limits. Exploration dumps 20 files into history. Refactoring loses focus.
+v2 adds planning. But for large tasks like "explore the codebase then refactor auth," a single agent hits a wall: its context fills with exploration details, leaving little room for actual work. This is **context pollution**.
 
-v3 adds the **Task tool**: spawn child agents with isolated context.
+## Subagent Lifecycle
 
-## The Problem
-
-Single-agent context pollution:
-
+```sh
+Main Agent (history=[..., 50 turns])
+    |
+    | Task(agent_type="explore", prompt="Find auth files")
+    v
++---------------------------------------------+
+| Subagent                                    |
+|                                             |
+|  sub_messages = [{"role":"user", prompt}]   <-- fresh history
+|  sub_tools = [bash, read_file]              <-- filtered (no Task)
+|  sub_system = "You are an explore agent..." <-- specialized prompt
+|                                             |
+|  while True:                                |
+|    response = model(sub_messages, sub_tools) |
+|    if stop_reason != "tool_use": break      |
+|    execute tools, append results            |
+|                                             |
+|  return final_text                          <-- only summary
++---------------------------------------------+
+    |
+    v
+Main Agent receives: "Auth in src/auth/login.py, src/auth/jwt.py..."
+(Main context stays clean -- never saw the 10 files subagent read)
 ```
-Main Agent History:
-  [exploring...] cat file1.py -> 500 lines
-  [exploring...] cat file2.py -> 300 lines
-  ... 15 more files ...
-  [now refactoring...] "wait, what did file1 contain?"
-```
 
-The solution: **delegate exploration to a subagent**:
-
-```
-Main Agent History:
-  [Task: explore codebase]
-    -> Subagent explores 20 files
-    -> Returns: "Auth in src/auth/, DB in src/models/"
-  [now refactoring with clean context]
-```
+The parent agent sees only the final summary. All intermediate tool calls, file contents, and exploration details stay in the subagent's isolated context.
 
 ## Agent Type Registry
-
-Each agent type defines capabilities:
 
 ```python
 AGENT_TYPES = {
     "explore": {
-        "description": "Read-only for searching and analyzing",
-        "tools": ["bash", "read_file"],  # No write
-        "prompt": "Search and analyze. Never modify. Return concise summary."
+        "tools": ["bash", "read_file"],          # Read-only
+        "prompt": "Search and analyze, but never modify files.",
     },
     "code": {
-        "description": "Full agent for implementation",
-        "tools": "*",  # All tools
-        "prompt": "Implement changes efficiently."
+        "tools": "*",                             # All base tools
+        "prompt": "Implement the requested changes efficiently.",
     },
     "plan": {
-        "description": "Planning and analysis",
-        "tools": ["bash", "read_file"],  # Read-only
-        "prompt": "Analyze and output numbered plan. Don't change files."
-    }
+        "tools": ["bash", "read_file"],          # Read-only
+        "prompt": "Analyze and output a numbered plan. Do NOT make changes.",
+    },
 }
 ```
 
-## The Task Tool
-
-```python
-{
-    "name": "Task",
-    "description": "Spawn a subagent for focused subtask",
-    "input_schema": {
-        "description": "Short task name (3-5 words)",
-        "prompt": "Detailed instructions",
-        "agent_type": "explore | code | plan"
-    }
-}
-```
-
-Main agent calls Task → child agent runs → returns summary.
-
-## Subagent Execution
-
-The heart of Task tool:
-
-```python
-def run_task(description, prompt, agent_type):
-    config = AGENT_TYPES[agent_type]
-
-    # 1. Agent-specific system prompt
-    sub_system = f"You are a {agent_type} subagent.\n{config['prompt']}"
-
-    # 2. Filtered tools
-    sub_tools = get_tools_for_agent(agent_type)
-
-    # 3. Isolated history (KEY: no parent context)
-    sub_messages = [{"role": "user", "content": prompt}]
-
-    # 4. Same query loop
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=sub_system,
-            messages=sub_messages, tools=sub_tools
-        )
-        if response.stop_reason != "tool_use":
-            break
-        # Execute tools, append results...
-
-    # 5. Return only final text
-    return extract_final_text(response)
-```
-
-**Key concepts:**
-
-| Concept | Implementation |
-|---------|---------------|
-| Context isolation | Fresh `sub_messages = []` |
-| Tool filtering | `get_tools_for_agent()` |
-| Specialized behavior | Agent-specific system prompt |
-| Result abstraction | Only final text returned |
+| Type | Tools | Purpose |
+|------|-------|---------|
+| explore | bash, read_file | Read-only exploration |
+| code | all base tools | Full implementation access |
+| plan | bash, read_file | Design without modifying |
 
 ## Tool Filtering
 
@@ -114,77 +64,85 @@ def run_task(description, prompt, agent_type):
 def get_tools_for_agent(agent_type):
     allowed = AGENT_TYPES[agent_type]["tools"]
     if allowed == "*":
-        return BASE_TOOLS  # No Task (no recursion in demo)
+        return BASE_TOOLS           # All base tools, but NOT Task
     return [t for t in BASE_TOOLS if t["name"] in allowed]
 ```
 
-- `explore`: bash + read_file only
-- `code`: all tools
-- `plan`: bash + read_file only
+Subagents never get the `Task` tool. This prevents infinite recursion (a subagent spawning another subagent spawning another...). In v0, this was handled by process boundaries; in v3, it is handled by tool filtering.
 
-Subagents don't get Task tool (prevents infinite recursion in this demo).
+## The Task Tool
+
+```python
+TASK_TOOL = {
+    "name": "Task",
+    "description": "Spawn a subagent for a focused subtask.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string"},    # Short name for display
+            "prompt": {"type": "string"},          # Detailed instructions
+            "agent_type": {"type": "string", "enum": ["explore", "code", "plan"]},
+        },
+        "required": ["description", "prompt", "agent_type"],
+    },
+}
+
+ALL_TOOLS = BASE_TOOLS + [TASK_TOOL]   # Main agent gets Task
+# Subagents get only filtered BASE_TOOLS (no Task)
+```
 
 ## Progress Display
 
-Subagent output doesn't pollute main chat:
+While a subagent runs, progress is shown in-place:
 
-```
-You: explore the codebase
-> Task: explore codebase
-  [explore] explore codebase ... 5 tools, 3.2s
-  [explore] explore codebase - done (8 tools, 5.1s)
-
-Here's what I found: ...
+```sh
+  [explore] find auth files ... 5 tools, 3.2s
+  [explore] find auth files - done (8 tools, 5.1s)
 ```
 
-Real-time progress, clean final output.
+This gives visibility without polluting the main conversation's context.
 
 ## Typical Flow
 
-```
+```sh
 User: "Refactor auth to use JWT"
 
 Main Agent:
   1. Task(explore): "Find all auth-related files"
      -> Subagent reads 10 files
-     -> Returns: "Auth in src/auth/login.py, session in..."
+     -> Returns: "Auth in src/auth/login.py..."
 
   2. Task(plan): "Design JWT migration"
      -> Subagent analyzes structure
-     -> Returns: "1. Add jwt lib 2. Create token utils..."
+     -> Returns: "1. Add jwt lib 2. Create utils..."
 
   3. Task(code): "Implement JWT tokens"
      -> Subagent writes code
      -> Returns: "Created jwt_utils.py, updated login.py"
 
-  4. Summarize changes
+  4. Summarize changes to user
 ```
 
-Each subagent has clean context. Main agent stays focused.
+Three subagents, each with clean context, each returning only a summary.
 
-## Comparison
+## v0 Recursion vs v3 Subagents
 
-| Aspect | v2 | v3 |
-|--------|----|----|
-| Context | Single, growing | Isolated per task |
-| Exploration | Pollutes history | Contained in subagent |
-| Parallelism | No | Possible (not in demo) |
-| Code added | ~300 lines | ~450 lines |
+| Aspect | v0 (self-recursion) | v3 (Task tool) |
+|--------|--------------------|--------------  |
+| Isolation | Process boundary | Message history |
+| Tools | Same (bash only) | Filtered per type |
+| Communication | stdout capture | Return value |
+| Spawning | `python v0_bash_agent.py "task"` | `Task(type, prompt)` |
+| Nesting | Unlimited | One level (no Task tool in subagents) |
 
-## The Pattern
+## The Deeper Insight
 
-```
-Complex Task
-  └─ Main Agent (coordinator)
-       ├─ Subagent A (explore) -> summary
-       ├─ Subagent B (plan) -> plan
-       └─ Subagent C (code) -> result
-```
+> **Divide context, not just tasks.**
 
-Same agent loop, different contexts. That's the whole trick.
+The real value of subagents is not parallelism (v3 subagents are synchronous). It is **context management**. By isolating exploration from implementation, each phase has full context window available. The parent stays clean, focused on orchestration.
 
 ---
 
-**Divide and conquer. Context isolation.**
+**Clean context enables clean thinking.**
 
-[← v2](./v2-structured-planning.md) | [Back to README](../README.md) | [v4 →](./v4-skills-mechanism.md)
+[<-- v2](./v2-structured-planning.md) | [Back to README](../README.md) | [v4 -->](./v4-skills-mechanism.md)

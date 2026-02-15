@@ -1,117 +1,131 @@
 # v0: Bash is All You Need
 
-**The ultimate simplification: ~50 lines, 1 tool, full agent capability.**
+**Core insight: One tool + one loop = a complete agent.**
 
-After building v1, v2, and v3, a question emerges: what is the *essence* of an agent?
+Strip away every feature of Claude Code, Cursor Agent, Codex CLI. What remains is a loop that lets the model call bash until done. Everything else -- file tools, planning, subagents -- is optimization on top of this core.
 
-v0 answers this by going backwards—stripping away everything until only the core remains.
+## The Agent Loop
 
-## The Core Insight
+```sh
+User prompt
+    |
+    v
++-------------------+
+| messages.create() |<---------+
+| model + tools     |          |
++--------+----------+          |
+         |                     |
+         v                     |
+  stop_reason == "tool_use"?   |
+         |                     |
+    no --+-- yes               |
+    |         |                |
+    v         v                |
+  return   execute bash        |
+  text     append result ------+
+```
 
-Unix philosophy: everything is a file, everything can be piped. Bash is the gateway to this world:
+The model decides everything: which commands to run, in what order, when to stop. The code just provides the loop and the tool.
 
-| You need | Bash command |
-|----------|--------------|
-| Read files | `cat`, `head`, `grep` |
-| Write files | `echo '...' > file` |
-| Search | `find`, `grep`, `rg` |
-| Execute | `python`, `npm`, `make` |
-| **Subagent** | `python v0_bash_agent.py "task"` |
-
-The last line is the key insight: **calling itself via bash implements subagents**. No Task tool, no Agent Registry—just recursion.
-
-## The Complete Code
+## One Tool Definition
 
 ```python
-#!/usr/bin/env python
-from anthropic import Anthropic
-import subprocess, sys, os
-
-client = Anthropic(api_key="your-key", base_url="...")
 TOOL = [{
     "name": "bash",
-    "description": """Execute shell command. Patterns:
-- Read: cat/grep/find/ls
-- Write: echo '...' > file
+    "description": """Execute shell command. Common patterns:
+- Read: cat/head/tail, grep/find/rg/ls, wc -l
+- Write: echo 'content' > file, sed -i 's/old/new/g' file
 - Subagent: python v0_bash_agent.py 'task description'""",
-    "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"]
+    }
 }]
-SYSTEM = f"CLI agent at {os.getcwd()}. Use bash. Spawn subagent for complex tasks."
-
-def chat(prompt, history=[]):
-    history.append({"role": "user", "content": prompt})
-    while True:
-        r = client.messages.create(model="...", system=SYSTEM, messages=history, tools=TOOL, max_tokens=8000)
-        history.append({"role": "assistant", "content": r.content})
-        if r.stop_reason != "tool_use":
-            return "".join(b.text for b in r.content if hasattr(b, "text"))
-        results = []
-        for b in r.content:
-            if b.type == "tool_use":
-                out = subprocess.run(b.input["command"], shell=True, capture_output=True, text=True, timeout=300)
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": out.stdout + out.stderr})
-        history.append({"role": "user", "content": results})
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        print(chat(sys.argv[1]))  # Subagent mode
-    else:
-        h = []
-        while (q := input(">> ")) not in ("q", ""):
-            print(chat(q, h))
 ```
 
-That's the entire agent. ~50 lines.
+The description teaches the model common patterns. The last line is the key insight: calling itself via bash implements subagents without a Task tool.
 
-## How Subagents Work
-
-```
-Main Agent
-  └─ bash: python v0_bash_agent.py "analyze architecture"
-       └─ Subagent (isolated process, fresh history)
-            ├─ bash: find . -name "*.py"
-            ├─ bash: cat src/main.py
-            └─ Returns summary via stdout
-```
-
-**Process isolation = Context isolation**
-- Child process has its own `history=[]`
-- Parent captures stdout as tool result
-- Recursive calls enable unlimited nesting
-
-## What v0 Sacrifices
-
-| Feature | v0 | v3 |
-|---------|----|----|
-| Agent types | None | explore/code/plan |
-| Tool filtering | None | Whitelists |
-| Progress display | Plain stdout | Inline updates |
-| Code complexity | ~50 lines | ~450 lines |
-
-## What v0 Proves
-
-**Complex capabilities emerge from simple rules:**
-
-1. **One tool is enough** — Bash is the gateway to everything
-2. **Recursion = hierarchy** — Self-calls implement subagents
-3. **Process = isolation** — OS provides context separation
-4. **Prompt = constraint** — Instructions shape behavior
-
-The core pattern never changes:
+## The Complete Agent
 
 ```python
-while True:
-    response = model(messages, tools)
-    if response.stop_reason != "tool_use":
-        return response.text
-    results = execute(response.tool_calls)
-    messages.append(results)
+def chat(prompt, history=None):
+    if history is None:
+        history = []
+    history.append({"role": "user", "content": prompt})
+
+    while True:
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM,
+            messages=history, tools=TOOL, max_tokens=8000
+        )
+        # Preserve both text and tool_use blocks in assistant message
+        history.append({"role": "assistant", "content": content})
+
+        if response.stop_reason != "tool_use":
+            return "".join(b.text for b in response.content if hasattr(b, "text"))
+
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                out = subprocess.run(
+                    block.input["command"], shell=True,
+                    capture_output=True, text=True, timeout=300, cwd=os.getcwd()
+                )
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": (out.stdout + out.stderr)[:50000]
+                })
+        history.append({"role": "user", "content": results})
 ```
 
-Everything else—todos, subagents, permissions—is refinement around this loop.
+Key parameters: `timeout=300` seconds per command, output truncated to 50000 characters.
+
+## Subagent via Self-Recursion
+
+```sh
+Main Agent (PID 100, history=[...])
+  |
+  +-- bash: python v0_bash_agent.py "analyze architecture"
+       |
+       Subagent (PID 200, history=[])   <-- fresh, isolated context
+         |-- bash: find . -name "*.py"
+         |-- bash: cat src/main.py
+         +-- Returns summary via stdout
+  |
+  Main Agent captures stdout as tool result
+```
+
+Process isolation = context isolation. The child process has its own `history=[]`, so the parent's context stays clean. This is implemented through `__main__`:
+
+```python
+if len(sys.argv) > 1:
+    print(chat(sys.argv[1]))   # Subagent mode
+else:
+    # Interactive REPL mode
+```
+
+## Why Bash is Enough
+
+| You need    | Bash command                          |
+|-------------|---------------------------------------|
+| Read files  | cat, head, tail, grep                 |
+| Write files | echo '...' > file, cat << 'EOF' > file|
+| Search      | find, grep, rg, ls                    |
+| Execute     | python, npm, make, any command        |
+| Subagent    | python v0_bash_agent.py "task"         |
+
+Unix philosophy says everything is a file, everything can be piped. Bash is the gateway to this world. One tool covers all of it.
+
+## The Deeper Insight
+
+> **The model IS the agent. Code just provides the loop.**
+
+There is no scheduler, no planner, no state machine in the code. The model decides what to do, the loop executes it. The simplest possible agent is already surprisingly capable.
 
 ---
 
-**Bash is All You Need.**
+**Everything starts with a loop and a shell.**
 
-[← Back to README](../README.md) | [v1 →](./v1-model-as-agent.md)
+[Back to README](../README.md) | [v1 -->](./v1-model-as-agent.md)

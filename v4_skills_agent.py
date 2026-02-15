@@ -84,25 +84,26 @@ import sys
 import time
 from pathlib import Path
 
+from anthropic import Anthropic
 from dotenv import load_dotenv
 
-load_dotenv()
-
-try:
-    from provider_utils import get_client, get_model
-except ImportError:
-    sys.exit("Error: provider_utils.py not found. Please ensure you are in the project root.")
+load_dotenv(override=True)
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
+# When using third-party endpoints (e.g. GLM), clear ANTHROPIC_AUTH_TOKEN
+# to prevent the SDK from sending a conflicting authorization header.
+if os.getenv("ANTHROPIC_BASE_URL"):
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
 WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
 
-client = get_client()
-MODEL = get_model()
+client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
 
 
 # =============================================================================
@@ -296,7 +297,7 @@ def get_agent_descriptions() -> str:
 # =============================================================================
 
 class TodoManager:
-    """Task list manager with constraints. See v2 for details."""
+    """Task list manager with constraints (max 20 items, single in_progress)."""
 
     def __init__(self):
         self.items = []
@@ -605,7 +606,7 @@ Follow the instructions in the skill above to complete the user's task."""
 
 
 def run_task(description: str, prompt: str, agent_type: str) -> str:
-    """Execute a subagent task (from v3). See v3 for details."""
+    """Execute a subagent task with isolated context and filtered tools."""
     if agent_type not in AGENT_TYPES:
         return f"Error: Unknown agent type '{agent_type}'"
 

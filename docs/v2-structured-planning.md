@@ -1,166 +1,127 @@
-# v2: Structured Planning with Todo
+# v2: Structured Planning
 
-**~300 lines. +1 tool. Explicit task tracking.**
+**Core insight: Structure constrains AND enables.**
 
-v1 works. But for complex tasks, the model can lose track.
+v1 works for simple tasks. Ask it to "refactor auth, add tests, update docs" and watch: without explicit planning, the model jumps between tasks, forgets completed steps, loses focus. Plans exist only in the model's "head" -- invisible and fragile.
 
-Ask it to "refactor auth, add tests, update docs" and watch what happens. Without explicit planning, it jumps between tasks, forgets steps, loses focus.
+## The Problem: Context Fade
 
-v2 adds one thing: **the Todo tool**. ~100 new lines that fundamentally change how the agent works.
+```sh
+v1: "I'll do A, then B, then C"     (invisible plan)
+    After 10 tool calls: "Wait, what was I doing?"
 
-## The Problem
+v2: [ ] Refactor auth module
+    [>] Add unit tests              <- Currently working on this
+    [ ] Update documentation
 
-In v1, plans exist only in the model's "head":
-
-```
-v1: "I'll do A, then B, then C"  (invisible)
-    After 10 tools: "Wait, what was I doing?"
-```
-
-The Todo tool makes it explicit:
-
-```
-v2:
-  [ ] Refactor auth module
-  [>] Add unit tests         <- Currently here
-  [ ] Update documentation
+    Now both YOU and the MODEL can see the plan.
 ```
 
-Now both you and the model can see the plan.
+## TodoWrite State Machine
+
+```sh
+                  TodoWrite(status)
+  +----------+  ----------------->  +--------------+  ----------------->  +-----------+
+  | pending  |                      | in_progress  |                      | completed |
+  |   [ ]    |                      |     [>]      |                      |    [x]    |
+  +----------+                      +--------------+                      +-----------+
+
+  Constraint: only ONE item can be in_progress at a time
+  Constraint: maximum 20 items in the list
+  Constraint: each item requires content, status, activeForm
+```
+
+The `activeForm` field is the present tense form shown when a task is active (e.g., content="Add tests", activeForm="Adding unit tests..."). This gives real-time visibility into what the agent is doing.
 
 ## TodoManager
 
-A list with constraints:
-
 ```python
 class TodoManager:
-    def __init__(self):
-        self.items = []  # Max 20
+    def update(self, items: list) -> str:
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            content = str(item.get("content", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            active_form = str(item.get("activeForm", "")).strip()
 
-    def update(self, items):
-        # Validation:
-        # - Each needs: content, status, activeForm
-        # - Status: pending | in_progress | completed
-        # - Only ONE can be in_progress
-        # - No duplicates, no empties
+            if not content:
+                raise ValueError(f"Item {i}: content required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {i}: invalid status '{status}'")
+            if not active_form:
+                raise ValueError(f"Item {i}: activeForm required")
+            if status == "in_progress":
+                in_progress_count += 1
+
+            validated.append({"content": content, "status": status, "activeForm": active_form})
+
+        if len(validated) > 20:
+            raise ValueError("Max 20 todos allowed")
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+
+        self.items = validated
+        return self.render()
 ```
 
-The constraints matter:
+The model sends a **complete new list** each time (not a diff). The manager validates it and returns a rendered view.
+
+## Rendered Output
+
+```sh
+[x] Refactor auth module
+[>] Add unit tests <- Adding unit tests...
+[ ] Update documentation
+
+(1/3 completed)
+```
+
+This rendered text is the tool result. The model sees it and can update the list based on its current state.
+
+## Soft Prompts: Reminders
+
+v2 uses two reminder mechanisms to encourage (not force) todo usage:
+
+```python
+# Shown at the start of conversation
+INITIAL_REMINDER = "<reminder>Use TodoWrite for multi-step tasks.</reminder>"
+
+# Shown if model hasn't updated todos in 10+ rounds
+NAG_REMINDER = "<reminder>10+ turns without todo update. Please update todos.</reminder>"
+```
+
+The NAG_REMINDER is injected inside the agent loop when `rounds_without_todo > 10`:
+
+```python
+if used_todo:
+    rounds_without_todo = 0
+else:
+    rounds_without_todo += 1
+
+if rounds_without_todo > 10:
+    results.insert(0, {"type": "text", "text": NAG_REMINDER})
+```
+
+## Key Constraints
 
 | Rule | Why |
 |------|-----|
-| Max 20 items | Prevents infinite lists |
-| One in_progress | Forces focus |
-| Required fields | Structured output |
+| Max 20 items | Prevents infinite task lists |
+| One in_progress | Forces focus on one thing at a time |
+| Required fields | Ensures structured, usable output |
+| Complete list replacement | Simpler than diff-based updates |
 
-These aren't arbitrary—they're guardrails.
-
-## The Tool
-
-```python
-{
-    "name": "TodoWrite",
-    "input_schema": {
-        "items": [{
-            "content": "Task description",
-            "status": "pending | in_progress | completed",
-            "activeForm": "Present tense: 'Reading files'"
-        }]
-    }
-}
-```
-
-The `activeForm` shows what's happening now:
-
-```
-[>] Reading authentication code...  <- activeForm
-[ ] Add unit tests
-```
-
-## System Reminders
-
-Soft constraints to encourage todo usage:
-
-```python
-INITIAL_REMINDER = "<reminder>Use TodoWrite for multi-step tasks.</reminder>"
-NAG_REMINDER = "<reminder>10+ turns without todo. Please update.</reminder>"
-```
-
-Injected as context, not commands:
-
-```python
-if rounds_without_todo > 10:
-    inject_reminder(NAG_REMINDER)
-```
-
-The model sees them but doesn't respond to them.
-
-## The Feedback Loop
-
-When model calls `TodoWrite`:
-
-```
-Input:
-  [x] Refactor auth (completed)
-  [>] Add tests (in_progress)
-  [ ] Update docs (pending)
-
-Returned:
-  "[x] Refactor auth
-   [>] Add tests
-   [ ] Update docs
-   (1/3 completed)"
-```
-
-Model sees its own plan. Updates it. Continues with context.
-
-## When Todos Help
-
-Not every task needs them:
-
-| Good for | Why |
-|----------|-----|
-| Multi-step work | 5+ steps to track |
-| Long conversations | 20+ tool calls |
-| Complex refactoring | Multiple files |
-| Teaching | Visible "thinking" |
-
-Rule of thumb: **if you'd write a checklist, use todos**.
-
-## Integration
-
-v2 adds to v1 without changing it:
-
-```python
-# v1 tools
-tools = [bash, read_file, write_file, edit_file]
-
-# v2 adds
-tools.append(TodoWrite)
-todo_manager = TodoManager()
-
-# v2 tracks usage
-if rounds_without_todo > 10:
-    inject_reminder()
-```
-
-~100 new lines. Same agent loop.
+These constraints are not limitations -- they are scaffolding. The `max_tokens` constraint enables manageable responses. Tool schemas constrain but enable structured calls. Todo constraints constrain but enable complex task completion.
 
 ## The Deeper Insight
 
-> **Structure constrains and enables.**
+> **Good constraints are scaffolding, not walls.**
 
-Todo constraints (max items, one in_progress) enable (visible plan, tracked progress).
-
-Pattern in agent design:
-- `max_tokens` constrains → enables manageable responses
-- Tool schemas constrain → enable structured calls
-- Todos constrain → enable complex task completion
-
-Good constraints aren't limitations. They're scaffolding.
+The pattern appears everywhere in agent design: constraints that seem limiting actually create structure that makes harder things possible. One in_progress at a time seems limiting, but it prevents the agent from thrashing between tasks.
 
 ---
 
-**Explicit planning makes agents reliable.**
+**Plans in the model's head are invisible. Plans in a tool are actionable.**
 
-[← v1](./v1-model-as-agent.md) | [Back to README](../README.md) | [v3 →](./v3-subagent-mechanism.md)
+[<-- v1](./v1-model-as-agent.md) | [Back to README](../README.md) | [v3 -->](./v3-subagent-mechanism.md)

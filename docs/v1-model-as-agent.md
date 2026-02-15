@@ -1,85 +1,88 @@
-# v1: Model as Agent
+# v1: The Model as Agent
 
-**~200 lines. 4 tools. The essence of every coding agent.**
+**Core insight: Four tools cover 90% of coding tasks.**
 
-The secret of Claude Code? **There is no secret.**
+v0 proves bash is enough for everything. But "enough" is not "ergonomic." Reading a file through `cat` and editing through `sed` works, but dedicated tools give the model structured input/output and safety guarantees.
 
-Strip away the CLI polish, the progress bars, the permission systems. What remains is surprisingly simple: a loop that lets the model call tools until the task is done.
+## The Four-Tool Agent Loop
 
-## The Core Insight
-
-Traditional assistants:
+```sh
+User input
+    |
+    v
++------------------+
+| messages.create( |<-----------+
+|   model, system, |            |
+|   messages,      |            |
+|   tools=4,       |            |
+|   max_tokens=8K  |            |
+| )                |            |
++--------+---------+            |
+         |                      |
+         v                      |
+  stop_reason == "tool_use"?    |
+         |                      |
+    no --+-- yes                |
+    |         |                 |
+    v         v                 |
+  return   for tc in calls:     |
+  msgs       execute_tool(tc)   |
+             collect results ---+
 ```
-User -> Model -> Text Response
-```
 
-Agent systems:
-```
-User -> Model -> [Tool -> Result]* -> Response
-                      ^___________|
-```
-
-The asterisk matters. The model calls tools **repeatedly** until it decides the task is complete. This transforms a chatbot into an autonomous agent.
-
-**Key insight**: The model is the decision-maker. Code just provides tools and runs the loop.
-
-## The Four Essential Tools
-
-Claude Code has ~20 tools. But 4 cover 90% of use cases:
-
-| Tool | Purpose | Example |
-|------|---------|---------|
-| `bash` | Run commands | `npm install`, `git status` |
-| `read_file` | Read contents | View `src/index.ts` |
-| `write_file` | Create/overwrite | Create `README.md` |
-| `edit_file` | Precise changes | Replace a function |
-
-With these 4 tools, the model can:
-- Explore codebases (`bash: find, grep, ls`)
-- Understand code (`read_file`)
-- Make changes (`write_file`, `edit_file`)
-- Run anything (`bash: python, npm, make`)
-
-## The Agent Loop
-
-The entire agent in one function:
+The loop is identical to v0. The difference is what happens inside `execute_tool`:
 
 ```python
-def agent_loop(messages):
-    while True:
-        # 1. Ask the model
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS
-        )
-
-        # 2. Print text output
-        for block in response.content:
-            if hasattr(block, "text"):
-                print(block.text)
-
-        # 3. If no tool calls, done
-        if response.stop_reason != "tool_use":
-            return messages
-
-        # 4. Execute tools, continue
-        results = []
-        for tc in response.tool_calls:
-            output = execute_tool(tc.name, tc.input)
-            results.append({"type": "tool_result", "tool_use_id": tc.id, "content": output})
-
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": results})
+def execute_tool(name, args):
+    if name == "bash":      return run_bash(args["command"])
+    if name == "read_file": return run_read(args["path"], args.get("limit"))
+    if name == "write_file": return run_write(args["path"], args["content"])
+    if name == "edit_file":  return run_edit(args["path"], args["old_text"], args["new_text"])
 ```
 
-**Why this works:**
-1. Model controls the loop (keeps calling tools until `stop_reason != "tool_use"`)
-2. Results become context (fed back as "user" messages)
-3. Memory is automatic (messages list accumulates history)
+## The Four Tools
+
+| Tool | Purpose | Key feature |
+|------|---------|-------------|
+| bash | Run any command | timeout=60s, dangerous command blocking |
+| read_file | Read file contents | Optional line limit, output truncation |
+| write_file | Create/overwrite files | Auto-creates parent directories |
+| edit_file | Surgical text replacement | Exact string match, first occurrence only |
+
+## Workspace Security
+
+```python
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
+```
+
+All file operations go through `safe_path()`, which resolves the path and checks it stays within the workspace. This prevents `../../../etc/passwd` attacks.
+
+Bash also blocks dangerous patterns:
+
+```python
+dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+if any(d in command for d in dangerous):
+    return "Error: Dangerous command blocked"
+```
+
+## edit_file: Exact String Matching
+
+```python
+def run_edit(path, old_text, new_text):
+    content = safe_path(path).read_text()
+    if old_text not in content:
+        return f"Error: Text not found in {path}"
+    new_content = content.replace(old_text, new_text, 1)  # First occurrence only
+    safe_path(path).write_text(new_content)
+```
+
+The `replace(..., 1)` is deliberate: replacing only the first occurrence prevents accidental mass changes when the matched text appears multiple times.
 
 ## System Prompt
-
-The only "configuration" needed:
 
 ```python
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
@@ -88,52 +91,31 @@ Loop: think briefly -> use tools -> report results.
 
 Rules:
 - Prefer tools over prose. Act, don't just explain.
-- Never invent file paths. Use ls/find first if unsure.
+- Never invent file paths. Use bash ls/find first if unsure.
 - Make minimal changes. Don't over-engineer.
 - After finishing, summarize what changed."""
 ```
 
-No complex logic. Just clear instructions.
+The system prompt teaches the agent its behavior pattern. The working directory is injected so the model knows where it is.
 
-## Why This Design Works
+## v0 vs v1
 
-**1. Simplicity**
-No state machines. No planning modules. No frameworks.
+| Aspect | v0 (bash only) | v1 (4 tools) |
+|--------|---------------|-------------|
+| File reading | cat, head, tail | read_file with line limit |
+| File writing | echo, cat << EOF | write_file with auto-mkdir |
+| File editing | sed -i | edit_file with exact match |
+| Security | None | safe_path + dangerous command blocking |
+| Timeout | 300s | 60s |
 
-**2. Model does the thinking**
-The model decides which tools, in what order, when to stop.
+## The Deeper Insight
 
-**3. Transparency**
-Every tool call visible. Every result in conversation.
+> **The model is the decision-maker. Code just provides tools and runs the loop.**
 
-**4. Extensibility**
-Add a tool = one function + one JSON schema.
-
-## What's Missing
-
-| Feature | Why omitted | Added in |
-|---------|-------------|----------|
-| Todo tracking | Not essential | v2 |
-| Subagents | Complexity | v3 |
-| Permissions | Trust model for learning | Production |
-
-The point: **the core is tiny**. Everything else is refinement.
-
-## The Bigger Picture
-
-Claude Code, Cursor Agent, Codex CLI, Devin—all share this pattern:
-
-```python
-while not done:
-    response = model(conversation, tools)
-    results = execute(response.tool_calls)
-    conversation.append(results)
-```
-
-Differences are in tools, display, safety. But the essence is always: **give the model tools and let it work**.
+The model decides which tools to call, in what order, when to stop. Four tools give it structured access to the filesystem and shell. Everything else -- planning, subagents, compression -- is built on top of this foundation.
 
 ---
 
-**Model as Agent. That's the whole secret.**
+**Four tools. One loop. A complete coding agent.**
 
-[← v0](./v0-bash-is-all-you-need.md) | [Back to README](../README.md) | [v2 →](./v2-structured-planning.md)
+[<-- v0](./v0-bash-is-all-you-need.md) | [Back to README](../README.md) | [v2 -->](./v2-structured-planning.md)
